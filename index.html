@@ -160,7 +160,7 @@
       <label for="autoReload">Auto-update on move/zoom</label>
       <input id="autoReload" type="checkbox" checked />
     </div>
-    <p class="hint">Move/zoom the map. With auto-update enabled, lines reload automatically after map movement. Results are cached locally for 45 days to improve responsiveness. Data source: OpenStreetMap via Overpass API.</p>
+    <p class="hint">Global view uses filtered OpenRailwayMap maxspeed tiles (worldwide). Zoom in for detailed local Overpass data and popups. Results are cached locally for 45 days.</p>
     <p id="status" class="status">Idle</p>
     <p id="counts" class="counts">Loaded: 0 railway ways | Visible: 0</p>
     <div class="swatches">
@@ -178,24 +178,195 @@
     crossorigin=""
   ></script>
   <script>
-    const map = L.map("map", { preferCanvas: true, zoomControl: true }).setView([48.67, 2.57], 10);
+    const thresholdInput = document.getElementById("threshold");
+    const loadBtn = document.getElementById("loadBtn");
+    const autoReloadInput = document.getElementById("autoReload");
+    const statusEl = document.getElementById("status");
+    const countsEl = document.getElementById("counts");
 
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    const DETAIL_MIN_ZOOM = 10;
+    const ORM_MAXSPEED_TILE_URL = "https://tiles.openrailwaymap.org/maxspeed/{z}/{x}/{y}.png";
+    const ORM_MAXSPEED_PALETTE = [
+      { speed: 10, rgb: [1, 0, 203] }, { speed: 20, rgb: [0, 30, 203] },
+      { speed: 30, rgb: [0, 61, 203] }, { speed: 40, rgb: [0, 91, 203] },
+      { speed: 50, rgb: [0, 122, 203] }, { speed: 60, rgb: [0, 152, 203] },
+      { speed: 70, rgb: [0, 183, 203] }, { speed: 80, rgb: [0, 203, 193] },
+      { speed: 90, rgb: [0, 203, 162] }, { speed: 100, rgb: [0, 203, 132] },
+      { speed: 110, rgb: [0, 203, 102] }, { speed: 120, rgb: [0, 203, 71] },
+      { speed: 130, rgb: [0, 203, 41] }, { speed: 140, rgb: [0, 203, 10] },
+      { speed: 150, rgb: [20, 203, 0] }, { speed: 160, rgb: [51, 203, 0] },
+      { speed: 170, rgb: [81, 203, 0] }, { speed: 180, rgb: [112, 203, 0] },
+      { speed: 190, rgb: [142, 203, 0] }, { speed: 200, rgb: [173, 203, 0] },
+      { speed: 210, rgb: [203, 203, 0] }, { speed: 220, rgb: [203, 173, 0] },
+      { speed: 230, rgb: [203, 142, 0] }, { speed: 240, rgb: [203, 112, 0] },
+      { speed: 250, rgb: [203, 81, 0] }, { speed: 260, rgb: [203, 51, 0] },
+      { speed: 270, rgb: [203, 20, 0] }, { speed: 280, rgb: [203, 0, 7] },
+      { speed: 290, rgb: [203, 0, 37] }, { speed: 300, rgb: [203, 0, 68] },
+      { speed: 320, rgb: [203, 0, 98] }, { speed: 340, rgb: [203, 0, 129] },
+      { speed: 360, rgb: [203, 0, 159] }, { speed: 380, rgb: [203, 0, 189] },
+    ];
+    const ORM_EXACT_COLOR_TO_SPEED = new Map(
+      ORM_MAXSPEED_PALETTE.map((entry) => [((entry.rgb[0] << 16) | (entry.rgb[1] << 8) | entry.rgb[2]), entry.speed]),
+    );
+    const ORM_COLOR_LOOKUP_CACHE = new Map();
+    const MAX_COLOR_DISTANCE = 42 * 42;
+
+    function speedBand(speed) {
+      if (speed >= 350) return { min: 350, hex: "#7a0026", rgb: [122, 0, 38] };
+      if (speed >= 300) return { min: 300, hex: "#c50032", rgb: [197, 0, 50] };
+      if (speed >= 250) return { min: 250, hex: "#ff8b00", rgb: [255, 139, 0] };
+      if (speed >= 200) return { min: 200, hex: "#00a35d", rgb: [0, 163, 93] };
+      return { min: 160, hex: "#1f6fbd", rgb: [31, 111, 189] };
+    }
+
+    function detectSpeedFromPixel(r, g, b) {
+      const key = (r << 16) | (g << 8) | b;
+      if (ORM_COLOR_LOOKUP_CACHE.has(key)) return ORM_COLOR_LOOKUP_CACHE.get(key);
+      if (ORM_EXACT_COLOR_TO_SPEED.has(key)) {
+        const value = ORM_EXACT_COLOR_TO_SPEED.get(key);
+        ORM_COLOR_LOOKUP_CACHE.set(key, value);
+        return value;
+      }
+
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      if ((max > 245 && max - min < 12) || max - min < 18) {
+        ORM_COLOR_LOOKUP_CACHE.set(key, null);
+        return null;
+      }
+
+      let bestSpeed = null;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (const entry of ORM_MAXSPEED_PALETTE) {
+        const dr = r - entry.rgb[0];
+        const dg = g - entry.rgb[1];
+        const db = b - entry.rgb[2];
+        const dist = (dr * dr) + (dg * dg) + (db * db);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestSpeed = entry.speed;
+        }
+      }
+
+      const finalValue = bestDist <= MAX_COLOR_DISTANCE ? bestSpeed : null;
+      ORM_COLOR_LOOKUP_CACHE.set(key, finalValue);
+      return finalValue;
+    }
+
+    function filterMaxspeedTilePixels(data, width, height, threshold) {
+      const filtered = new Uint8ClampedArray(data.length);
+      for (let i = 0; i < data.length; i += 4) {
+        const alpha = data[i + 3];
+        if (alpha === 0) continue;
+
+        const speed = detectSpeedFromPixel(data[i], data[i + 1], data[i + 2]);
+        if (!speed || speed < threshold) continue;
+
+        const band = speedBand(speed);
+        filtered[i] = band.rgb[0];
+        filtered[i + 1] = band.rgb[1];
+        filtered[i + 2] = band.rgb[2];
+        filtered[i + 3] = alpha;
+      }
+
+      // Slightly thicken global lines for readability.
+      const thickened = new Uint8ClampedArray(filtered);
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const idx = ((y * width) + x) * 4;
+          if (filtered[idx + 3] === 0) continue;
+
+          const bleedAlpha = Math.max(80, Math.floor(filtered[idx + 3] * 0.65));
+          const neighbors = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+          for (const [nx, ny] of neighbors) {
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            const nIdx = ((ny * width) + nx) * 4;
+            if (thickened[nIdx + 3] !== 0) continue;
+            thickened[nIdx] = filtered[idx];
+            thickened[nIdx + 1] = filtered[idx + 1];
+            thickened[nIdx + 2] = filtered[idx + 2];
+            thickened[nIdx + 3] = bleedAlpha;
+          }
+        }
+      }
+
+      data.set(thickened);
+    }
+
+    const map = L.map("map", { preferCanvas: true, zoomControl: true }).setView([54, 15], 4);
+    window.__railMap = map;
+
+    L.tileLayer("https://maps.wikimedia.org/osm-intl/{z}/{x}/{y}.png", {
       maxZoom: 19,
-      attribution: "Data: OpenStreetMap contributors",
+      attribution: "Data: OpenStreetMap contributors, map style: Wikimedia maps",
+    }).addTo(map);
+
+    class FilteredMaxspeedTileLayer extends L.GridLayer {
+      initialize(options = {}) {
+        super.initialize(options);
+        this.threshold = options.threshold || 160;
+      }
+
+      setThreshold(threshold) {
+        this.threshold = threshold;
+        this.redraw();
+      }
+
+      createTile(coords, done) {
+        const size = this.getTileSize();
+        const tile = document.createElement("canvas");
+        tile.width = size.x;
+        tile.height = size.y;
+        const ctx = tile.getContext("2d", { willReadFrequently: true });
+
+        const maxIndex = 2 ** coords.z;
+        const wrappedX = ((coords.x % maxIndex) + maxIndex) % maxIndex;
+        if (coords.y < 0 || coords.y >= maxIndex) {
+          done(null, tile);
+          return tile;
+        }
+
+        const src = ORM_MAXSPEED_TILE_URL
+          .replace("{z}", String(coords.z))
+          .replace("{x}", String(wrappedX))
+          .replace("{y}", String(coords.y));
+
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.decoding = "async";
+        image.onload = () => {
+          try {
+            ctx.drawImage(image, 0, 0, size.x, size.y);
+            const imageData = ctx.getImageData(0, 0, size.x, size.y);
+            filterMaxspeedTilePixels(imageData.data, size.x, size.y, this.threshold);
+            ctx.putImageData(imageData, 0, 0);
+          } catch (err) {
+            ctx.clearRect(0, 0, size.x, size.y);
+          }
+          done(null, tile);
+        };
+        image.onerror = () => {
+          ctx.clearRect(0, 0, size.x, size.y);
+          done(null, tile);
+        };
+        image.src = src;
+        return tile;
+      }
+    }
+
+    const globalLayer = new FilteredMaxspeedTileLayer({
+      threshold: Number(thresholdInput.value),
+      opacity: 0.92,
+      attribution: "Rail data/rendering: OpenRailwayMap",
     }).addTo(map);
 
     const overlayLayer = L.geoJSON([], {
       style: (feature) => {
         const speed = feature.properties.maxspeed_kmh;
-        let color = "#1f6fbd";
-        if (speed >= 350) color = "#7a0026";
-        else if (speed >= 300) color = "#c50032";
-        else if (speed >= 250) color = "#ff8b00";
-        else if (speed >= 200) color = "#00a35d";
+        const color = speedBand(speed).hex;
         return {
           color,
-          weight: 3,
+          weight: 4,
           opacity: 0.95,
           lineCap: "round",
           lineJoin: "round",
@@ -203,7 +374,9 @@
       },
       onEachFeature: (feature, layer) => {
         const tags = feature.properties.tags;
+        const preferredName = getPreferredLatinName(tags);
         const popup = [
+          preferredName ? `name: <strong>${preferredName}</strong>` : null,
           `Max speed (computed): <strong>${feature.properties.maxspeed_kmh} km/h</strong>`,
           tags.maxspeed ? `maxspeed: ${tags.maxspeed}` : null,
           tags["maxspeed:forward"] ? `maxspeed:forward: ${tags["maxspeed:forward"]}` : null,
@@ -214,13 +387,7 @@
         ].filter(Boolean);
         layer.bindPopup(popup.join("<br>"));
       },
-    }).addTo(map);
-
-    const thresholdInput = document.getElementById("threshold");
-    const loadBtn = document.getElementById("loadBtn");
-    const autoReloadInput = document.getElementById("autoReload");
-    const statusEl = document.getElementById("status");
-    const countsEl = document.getElementById("counts");
+    });
 
     const overpassEndpoints = [
       "https://overpass-api.de/api/interpreter",
@@ -252,6 +419,30 @@
 
     function setCounts(total, visible) {
       countsEl.textContent = `Loaded: ${total} railway ways | Visible: ${visible}`;
+    }
+
+    function isDetailMode() {
+      return map.getZoom() >= DETAIL_MIN_ZOOM;
+    }
+
+    function updateModeUI() {
+      const detailMode = isDetailMode();
+      if (detailMode) {
+        if (!map.hasLayer(overlayLayer)) {
+          map.addLayer(overlayLayer);
+        }
+        loadBtn.disabled = isLoading;
+        return;
+      }
+
+      if (map.hasLayer(overlayLayer)) {
+        map.removeLayer(overlayLayer);
+      }
+      loadBtn.disabled = true;
+      setCounts(0, 0);
+      if (!isLoading) {
+        setStatus(`Global mode active (worldwide). Threshold is applied instantly. Zoom to ${DETAIL_MIN_ZOOM}+ for detailed local data and popups.`);
+      }
     }
 
     function boundsArea(bounds) {
@@ -379,6 +570,22 @@
       return Math.max(...values);
     }
 
+    function getPreferredLatinName(tags) {
+      if (!tags) return null;
+      const preferredKeys = [
+        "name:en",
+        "int_name",
+        "name:latin",
+        "official_name:en",
+        "short_name:en",
+        "name",
+      ];
+      for (const key of preferredKeys) {
+        if (tags[key]) return tags[key];
+      }
+      return null;
+    }
+
     function formatLoadMeta(meta) {
       if (!meta) return "";
       const parts = [];
@@ -389,6 +596,11 @@
     }
 
     function renderByThreshold(loadMeta = null) {
+      if (!isDetailMode()) {
+        updateModeUI();
+        return;
+      }
+
       const threshold = Number(thresholdInput.value);
       const visible = lastLoadedFeatures.filter((feature) => feature.properties.maxspeed_kmh >= threshold);
       overlayLayer.clearLayers();
@@ -552,6 +764,7 @@ out tags geom;`;
     }
 
     function schedulePrefetch(bounds) {
+      if (!isDetailMode()) return;
       if (Date.now() - lastPrefetchAt < PREFETCH_MIN_INTERVAL_MS) return;
       if (prefetchTimer) clearTimeout(prefetchTimer);
       const targetBounds = L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
@@ -625,6 +838,11 @@ out tags geom;`;
     }
 
     async function loadDataInView(trigger = "manual") {
+      if (!isDetailMode()) {
+        updateModeUI();
+        return;
+      }
+
       if (isLoading) {
         pendingReload = true;
         return;
@@ -642,7 +860,7 @@ out tags geom;`;
       }
 
       isLoading = true;
-      loadBtn.disabled = true;
+      updateModeUI();
       try {
         const area = boundsArea(bounds);
         let allElements = [];
@@ -678,7 +896,7 @@ out tags geom;`;
         setStatus(`Load failed: ${err.message}`, true);
       } finally {
         isLoading = false;
-        loadBtn.disabled = false;
+        updateModeUI();
         if (pendingReload) {
           pendingReload = false;
           loadDataInView("auto");
@@ -688,19 +906,39 @@ out tags geom;`;
 
     function scheduleAutoReload() {
       if (!autoReloadInput.checked) return;
+      if (!isDetailMode()) {
+        updateModeUI();
+        return;
+      }
       if (autoReloadTimer) clearTimeout(autoReloadTimer);
       autoReloadTimer = setTimeout(() => loadDataInView("auto"), 600);
     }
 
+    function handleMapMoveEnd() {
+      updateModeUI();
+      scheduleAutoReload();
+    }
+
     loadBtn.addEventListener("click", () => loadDataInView("manual"));
-    map.on("moveend", scheduleAutoReload);
+    map.on("moveend", handleMapMoveEnd);
     autoReloadInput.addEventListener("change", () => {
       if (autoReloadInput.checked) {
         scheduleAutoReload();
+      } else if (autoReloadTimer) {
+        clearTimeout(autoReloadTimer);
+        autoReloadTimer = null;
       }
     });
-    thresholdInput.addEventListener("change", () => renderByThreshold());
+    thresholdInput.addEventListener("change", () => {
+      globalLayer.setThreshold(Number(thresholdInput.value));
+      if (isDetailMode()) {
+        renderByThreshold();
+      } else {
+        updateModeUI();
+      }
+    });
     cleanupExpiredCache().catch(() => {});
+    updateModeUI();
     loadDataInView("auto");
   </script>
 </body>
