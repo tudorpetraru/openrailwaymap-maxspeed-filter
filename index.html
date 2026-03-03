@@ -13,8 +13,8 @@
   <style>
     :root {
       --bg: #f6f7f8;
-      --panel: #ffffff;
-      --border: #d7dce2;
+      --panel: rgba(250, 252, 255, 0.6);
+      --border: rgba(154, 168, 183, 0.6);
       --text: #14202b;
       --muted: #4d5b68;
       --accent: #005fcc;
@@ -45,8 +45,10 @@
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 12px;
-      box-shadow: 0 10px 24px rgba(12, 28, 44, 0.14);
-      padding: 12px;
+      box-shadow: 0 10px 24px rgba(12, 28, 44, 0.2);
+      backdrop-filter: blur(8px) saturate(135%);
+      -webkit-backdrop-filter: blur(8px) saturate(135%);
+      padding: 12px 12px 10px;
     }
 
     .title {
@@ -56,16 +58,17 @@
     }
 
     .row {
-      display: flex;
-      gap: 8px;
+      display: grid;
+      grid-template-columns: 1fr 170px;
+      column-gap: 12px;
       align-items: center;
-      margin-bottom: 8px;
-      flex-wrap: wrap;
+      margin-bottom: 10px;
     }
 
     label {
       font-size: 13px;
       color: var(--muted);
+      line-height: 1.25;
     }
 
     select,
@@ -75,8 +78,12 @@
       height: 36px;
       padding: 0 10px;
       font-size: 14px;
-      background: #fff;
+      background: rgba(255, 255, 255, 0.92);
       color: var(--text);
+    }
+
+    select {
+      width: 100%;
     }
 
     button {
@@ -85,6 +92,14 @@
       border-color: var(--accent);
       cursor: pointer;
       font-weight: 600;
+    }
+
+    .secondary-btn {
+      background: #f2f4f7;
+      color: var(--text);
+      border-color: var(--border);
+      font-weight: 600;
+      height: 32px;
     }
 
     button:disabled {
@@ -124,6 +139,13 @@
       margin-top: 6px;
     }
 
+    @media (max-width: 520px) {
+      .row {
+        grid-template-columns: 1fr;
+        row-gap: 6px;
+      }
+    }
+
     .swatch {
       display: inline-flex;
       align-items: center;
@@ -154,14 +176,20 @@
         <option value="300">300 km/h</option>
         <option value="350">350 km/h</option>
       </select>
-      <button id="loadBtn" type="button">Load In View</button>
     </div>
     <div class="row">
-      <label for="autoReload">Auto-update on move/zoom</label>
-      <input id="autoReload" type="checkbox" checked />
+      <label for="basemapStyle">Background style</label>
+      <select id="basemapStyle">
+        <option value="subdued" selected>Subdued (rail focus)</option>
+        <option value="wikimedia">Geographic Intl</option>
+        <option value="standard">Street (Latin labels)</option>
+        <option value="dark">Dark muted</option>
+        <option value="blank">Blank</option>
+      </select>
     </div>
-    <p class="hint">Global view uses filtered OpenRailwayMap maxspeed tiles (worldwide). Zoom in for detailed local Overpass data and popups. Results are cached locally for 45 days.</p>
+    <p class="hint">Global view uses filtered OpenRailwayMap maxspeed tiles (worldwide). Detail mode auto-updates on map move/zoom. Results are cached locally for 45 days.</p>
     <p id="status" class="status">Idle</p>
+    <button id="retryBtn" type="button" class="secondary-btn" hidden>Retry detail data</button>
     <p id="counts" class="counts">Loaded: 0 railway ways | Visible: 0</p>
     <div class="swatches">
       <span class="swatch"><span class="dot" style="background:#1f6fbd"></span>160-199</span>
@@ -179,8 +207,8 @@
   ></script>
   <script>
     const thresholdInput = document.getElementById("threshold");
-    const loadBtn = document.getElementById("loadBtn");
-    const autoReloadInput = document.getElementById("autoReload");
+    const retryBtn = document.getElementById("retryBtn");
+    const basemapInput = document.getElementById("basemapStyle");
     const statusEl = document.getElementById("status");
     const countsEl = document.getElementById("counts");
 
@@ -296,11 +324,79 @@
     const map = L.map("map", { preferCanvas: true, zoomControl: true }).setView([54, 15], 4);
     window.__railMap = map;
 
-    L.tileLayer("https://maps.wikimedia.org/osm-intl/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      attribution: "Data: OpenStreetMap contributors, map style: Wikimedia maps",
-    }).addTo(map);
+    const blankBasemap = L.gridLayer({
+      attribution: "Data: OpenStreetMap contributors, Tiles © Esri",
+    });
+    blankBasemap.createTile = function createBlankTile() {
+      const tile = document.createElement("div");
+      tile.style.background = "#f3f5f6";
+      return tile;
+    };
 
+    const latinCityLabelsLight = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 16,
+      attribution: "Labels © Esri",
+    });
+    const latinCityLabelsDark = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 16,
+      attribution: "Labels © Esri",
+    });
+
+    const basemapConfigs = {
+      subdued: {
+        base: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}", {
+          maxZoom: 16,
+          attribution: "Data: OpenStreetMap contributors, Tiles © Esri",
+        }),
+        labels: latinCityLabelsLight,
+      },
+      wikimedia: {
+        base: L.tileLayer("https://maps.wikimedia.org/osm-intl/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: "Data: OpenStreetMap contributors, map style: Wikimedia maps",
+        }),
+        labels: null,
+      },
+      standard: {
+        base: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
+          maxZoom: 19,
+          attribution: "Data: OpenStreetMap contributors, Tiles © Esri",
+        }),
+        labels: null,
+      },
+      dark: {
+        base: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}", {
+          maxZoom: 16,
+          attribution: "Data: OpenStreetMap contributors, Tiles © Esri",
+        }),
+        labels: latinCityLabelsDark,
+      },
+      blank: {
+        base: blankBasemap,
+        labels: latinCityLabelsLight,
+      },
+    };
+
+    let activeBasemapLayer = null;
+    let activeBasemapLabelLayer = null;
+    function setBasemapStyle(styleKey) {
+      const nextKey = basemapConfigs[styleKey] ? styleKey : "subdued";
+      const cfg = basemapConfigs[nextKey];
+      if (activeBasemapLayer) {
+        map.removeLayer(activeBasemapLayer);
+      }
+      if (activeBasemapLabelLayer) {
+        map.removeLayer(activeBasemapLabelLayer);
+      }
+      activeBasemapLayer = cfg.base;
+      activeBasemapLayer.addTo(map);
+      activeBasemapLayer.bringToBack();
+
+      activeBasemapLabelLayer = cfg.labels;
+      if (activeBasemapLabelLayer) {
+        activeBasemapLabelLayer.addTo(map);
+      }
+    }
     class FilteredMaxspeedTileLayer extends L.GridLayer {
       initialize(options = {}) {
         super.initialize(options);
@@ -359,6 +455,8 @@
       opacity: 0.92,
       attribution: "Rail data/rendering: OpenRailwayMap",
     }).addTo(map);
+    setBasemapStyle(basemapInput.value);
+    globalLayer.bringToFront();
 
     const overlayLayer = L.geoJSON([], {
       style: (feature) => {
@@ -406,6 +504,7 @@
     let lastLoadedFeatures = [];
     let isLoading = false;
     let pendingReload = false;
+    let detailLoadFailed = false;
     let autoReloadTimer = null;
     let prefetchInProgress = false;
     let prefetchTimer = null;
@@ -421,6 +520,10 @@
       countsEl.textContent = `Loaded: ${total} railway ways | Visible: ${visible}`;
     }
 
+    function updateRetryButton() {
+      retryBtn.hidden = !(isDetailMode() && detailLoadFailed && !isLoading);
+    }
+
     function isDetailMode() {
       return map.getZoom() >= DETAIL_MIN_ZOOM;
     }
@@ -431,14 +534,15 @@
         if (!map.hasLayer(overlayLayer)) {
           map.addLayer(overlayLayer);
         }
-        loadBtn.disabled = isLoading;
+        updateRetryButton();
         return;
       }
 
       if (map.hasLayer(overlayLayer)) {
         map.removeLayer(overlayLayer);
       }
-      loadBtn.disabled = true;
+      detailLoadFailed = false;
+      updateRetryButton();
       setCounts(0, 0);
       if (!isLoading) {
         setStatus(`Global mode active (worldwide). Threshold is applied instantly. Zoom to ${DETAIL_MIN_ZOOM}+ for detailed local data and popups.`);
@@ -772,7 +876,6 @@ out tags geom;`;
     }
 
     async function prefetchNearby(bounds) {
-      if (!autoReloadInput.checked) return;
       if (prefetchInProgress) return;
       if (boundsArea(bounds) > SPLIT_QUERY_AREA) return;
 
@@ -860,6 +963,7 @@ out tags geom;`;
       }
 
       isLoading = true;
+      detailLoadFailed = false;
       updateModeUI();
       try {
         const area = boundsArea(bounds);
@@ -893,6 +997,7 @@ out tags geom;`;
         renderByThreshold(loadMeta);
         schedulePrefetch(bounds);
       } catch (err) {
+        detailLoadFailed = true;
         setStatus(`Load failed: ${err.message}`, true);
       } finally {
         isLoading = false;
@@ -905,7 +1010,6 @@ out tags geom;`;
     }
 
     function scheduleAutoReload() {
-      if (!autoReloadInput.checked) return;
       if (!isDetailMode()) {
         updateModeUI();
         return;
@@ -919,14 +1023,13 @@ out tags geom;`;
       scheduleAutoReload();
     }
 
-    loadBtn.addEventListener("click", () => loadDataInView("manual"));
+    retryBtn.addEventListener("click", () => loadDataInView("manual"));
     map.on("moveend", handleMapMoveEnd);
-    autoReloadInput.addEventListener("change", () => {
-      if (autoReloadInput.checked) {
-        scheduleAutoReload();
-      } else if (autoReloadTimer) {
-        clearTimeout(autoReloadTimer);
-        autoReloadTimer = null;
+    basemapInput.addEventListener("change", () => {
+      setBasemapStyle(basemapInput.value);
+      globalLayer.bringToFront();
+      if (map.hasLayer(overlayLayer)) {
+        overlayLayer.bringToFront();
       }
     });
     thresholdInput.addEventListener("change", () => {
