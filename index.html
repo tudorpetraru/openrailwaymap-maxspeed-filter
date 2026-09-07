@@ -36,12 +36,21 @@
       z-index: 0;
     }
 
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .panel-header .title { margin: 0; }
+    .panel details { margin-top: 12px; font-size: 12px; color: var(--muted); }
+    .panel summary { cursor: pointer; padding: 4px 0; }
     .panel {
       position: fixed;
       z-index: 800;
       top: 12px;
       left: 12px;
-      width: min(420px, calc(100vw - 24px));
+      width: min(420px, calc(100vw - 76px));
+      max-height: calc(100dvh - 24px);
+      overflow-y: auto;
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 12px;
@@ -59,7 +68,7 @@
 
     .row {
       display: grid;
-      grid-template-columns: 1fr 170px;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 190px);
       column-gap: 12px;
       align-items: center;
       margin-bottom: 10px;
@@ -166,9 +175,13 @@
   <div id="map"></div>
 
   <section class="panel">
-    <h1 class="title">Rail Lines By Max Speed</h1>
+    <div class="panel-header">
+      <h1 class="title">Rail Lines By Max Speed</h1>
+      <button id="panelToggle" class="secondary-btn" type="button" aria-expanded="true" aria-controls="panelBody">Collapse</button>
+    </div>
+    <div id="panelBody">
     <div class="row">
-      <label for="threshold">Show only lines with max speed at least</label>
+      <label for="threshold">Minimum speed</label>
       <select id="threshold">
         <option value="160" selected>160 km/h</option>
         <option value="200">200 km/h</option>
@@ -187,16 +200,23 @@
         <option value="blank">Blank</option>
       </select>
     </div>
-    <p class="hint">Global view uses filtered OpenRailwayMap maxspeed tiles (worldwide). Detail mode auto-updates on map move/zoom. Results are cached locally for 45 days.</p>
-    <p id="status" class="status">Idle</p>
+
+    <p id="status" class="status" role="status" aria-live="polite">World view</p>
     <button id="retryBtn" type="button" class="secondary-btn" hidden>Retry detail data</button>
-    <p id="counts" class="counts">Loaded: 0 railway ways | Visible: 0</p>
+
     <div class="swatches">
       <span class="swatch"><span class="dot" style="background:#1f6fbd"></span>160-199</span>
       <span class="swatch"><span class="dot" style="background:#00a35d"></span>200-249</span>
       <span class="swatch"><span class="dot" style="background:#ff8b00"></span>250-299</span>
       <span class="swatch"><span class="dot" style="background:#c50032"></span>300-349</span>
       <span class="swatch"><span class="dot" style="background:#7a0026"></span>350+</span>
+    </div>
+    <details>
+      <summary>About the map and data</summary>
+      <p class="hint">World view estimates speeds from OpenRailwayMap tile colours. Zoom in for tagged speeds and line details. Detail data updates automatically and is cached for 45 days.</p>
+      <p id="counts" class="counts"></p>
+      <p id="loadDetails" class="hint"></p>
+    </details>
     </div>
   </section>
 
@@ -205,6 +225,7 @@
     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
     crossorigin=""
   ></script>
+  <script src="rail-data.js"></script>
   <script>
     const thresholdInput = document.getElementById("threshold");
     const retryBtn = document.getElementById("retryBtn");
@@ -323,6 +344,16 @@
 
     const map = L.map("map", { preferCanvas: true, zoomControl: true }).setView([54, 15], 4);
     window.__railMap = map;
+    map.zoomControl.setPosition("topright");
+    const panel = document.querySelector(".panel");
+    L.DomEvent.disableClickPropagation(panel);
+    L.DomEvent.disableScrollPropagation(panel);
+    document.getElementById("panelToggle").addEventListener("click", (event) => {
+      const body = document.getElementById("panelBody");
+      body.hidden = !body.hidden;
+      event.currentTarget.textContent = body.hidden ? "Expand" : "Collapse";
+      event.currentTarget.setAttribute("aria-expanded", String(!body.hidden));
+    });
 
     const blankBasemap = L.gridLayer({
       attribution: "Data: OpenStreetMap contributors, Tiles © Esri",
@@ -452,6 +483,7 @@
 
     const globalLayer = new FilteredMaxspeedTileLayer({
       threshold: Number(thresholdInput.value),
+      maxNativeZoom: 9,
       opacity: 0.92,
       attribution: "Rail data/rendering: OpenRailwayMap",
     }).addTo(map);
@@ -494,7 +526,7 @@
       "https://overpass.kumi.systems/api/interpreter",
     ];
     const MAX_BBOX_AREA = 20;
-    const SPLIT_QUERY_AREA = 6;
+    const MAX_VISIBLE_CELLS = 100;
     const CACHE_TTL_MS = 45 * 24 * 60 * 60 * 1000;
     const CACHE_DB_NAME = "rail-maxspeed-cache-v1";
     const CACHE_DB_VERSION = 1;
@@ -503,10 +535,13 @@
 
     let lastLoadedFeatures = [];
     let isLoading = false;
-    let pendingReload = false;
+    let loadController = null;
+    let loadGeneration = 0;
+    let detailReady = false;
+    const memoryCache = new Map();
     let detailLoadFailed = false;
     let autoReloadTimer = null;
-    let prefetchInProgress = false;
+
     let prefetchTimer = null;
     let lastPrefetchAt = 0;
     let cacheDbPromise = null;
@@ -530,6 +565,7 @@
 
     function updateModeUI() {
       const detailMode = isDetailMode();
+      globalLayer.setOpacity(detailMode && detailReady ? 0 : 0.92);
       if (detailMode) {
         if (!map.hasLayer(overlayLayer)) {
           map.addLayer(overlayLayer);
@@ -545,7 +581,7 @@
       updateRetryButton();
       setCounts(0, 0);
       if (!isLoading) {
-        setStatus(`Global mode active (worldwide). Threshold is applied instantly. Zoom to ${DETAIL_MIN_ZOOM}+ for detailed local data and popups.`);
+        setStatus("World view. Zoom in for line details.");
       }
     }
 
@@ -553,24 +589,7 @@
       return Math.abs((bounds.getNorth() - bounds.getSouth()) * (bounds.getEast() - bounds.getWest()));
     }
 
-    function roundCoord(value, precision = 3) {
-      const factor = 10 ** precision;
-      return (Math.round(value * factor) / factor).toFixed(precision);
-    }
-
-    function getBoundsCacheKey(bounds) {
-      return [
-        "bbox",
-        roundCoord(bounds.getSouth()),
-        roundCoord(bounds.getWest()),
-        roundCoord(bounds.getNorth()),
-        roundCoord(bounds.getEast()),
-      ].join(":");
-    }
-
-    function isCacheFresh(record) {
-      return Boolean(record && Date.now() - record.timestamp <= CACHE_TTL_MS);
-    }
+    const isCacheFresh = RailData.fresh;
 
     function getCacheDb() {
       if (!("indexedDB" in window)) return Promise.resolve(null);
@@ -585,12 +604,13 @@
         };
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
+        request.onblocked = () => reject(new Error("Cache unavailable"));
       });
 
       return cacheDbPromise;
     }
 
-    async function cacheGet(key) {
+    async function diskGet(key) {
       const db = await getCacheDb();
       if (!db) return null;
 
@@ -603,7 +623,7 @@
       });
     }
 
-    async function cachePut(key, elements) {
+    async function diskPut(key, elements) {
       const db = await getCacheDb();
       if (!db) return;
 
@@ -620,11 +640,34 @@
       });
     }
 
+    async function cacheGet(key) {
+      if (memoryCache.has(key)) return memoryCache.get(key);
+      return optionalStorage(() => diskGet(key), null);
+    }
+
+    async function optionalStorage(work, fallback) {
+      let timeout;
+      try {
+        return await Promise.race([
+          Promise.resolve().then(work),
+          new Promise(resolve => { timeout = setTimeout(() => resolve(fallback), 1500); }),
+        ]);
+      } catch { return fallback; }
+      finally { clearTimeout(timeout); }
+    }
+
+    async function cachePut(key, elements) {
+      memoryCache.delete(key);
+      memoryCache.set(key, { key, timestamp: Date.now(), elements });
+      if (memoryCache.size > 160) memoryCache.delete(memoryCache.keys().next().value);
+      await optionalStorage(() => diskPut(key, elements));
+    }
+
     async function cleanupExpiredCache() {
       const db = await getCacheDb();
       if (!db) return;
 
-      const cutoff = Date.now() - CACHE_TTL_MS;
+      const cutoff = Date.now() - CACHE_TTL_MS * 2;
       return new Promise((resolve, reject) => {
         const tx = db.transaction(CACHE_STORE_NAME, "readwrite");
         const store = tx.objectStore(CACHE_STORE_NAME);
@@ -710,13 +753,9 @@
       overlayLayer.clearLayers();
       overlayLayer.addData(visible);
       setCounts(lastLoadedFeatures.length, visible.length);
-      const sourceSuffix = formatLoadMeta(loadMeta);
-      if (!lastLoadedFeatures.length) {
-        setStatus(`No railway ways with usable maxspeed tags were found in the current map view.${sourceSuffix}`, true);
-      } else if (!visible.length) {
-        setStatus(`Loaded data${sourceSuffix}, but no lines are >= ${threshold} km/h in this view.`);
-      } else {
-        setStatus(`Showing ${visible.length} lines with max speed >= ${threshold} km/h${sourceSuffix}`);
+      if (loadMeta) document.getElementById("loadDetails").textContent = formatLoadMeta(loadMeta);
+      if (!isLoading && !detailLoadFailed) {
+        setStatus(visible.length ? `Showing ${visible.length} lines at ${threshold}+ km/h` : "No matching detailed lines in this area.");
       }
     }
 
@@ -743,171 +782,62 @@ out tags geom;`;
       return null;
     }
 
-    function splitBounds(bounds) {
-      const south = bounds.getSouth();
-      const west = bounds.getWest();
-      const north = bounds.getNorth();
-      const east = bounds.getEast();
-      const midLat = (south + north) / 2;
-      const midLon = (west + east) / 2;
-
-      return [
-        L.latLngBounds([south, west], [midLat, midLon]),
-        L.latLngBounds([south, midLon], [midLat, east]),
-        L.latLngBounds([midLat, west], [north, midLon]),
-        L.latLngBounds([midLat, midLon], [north, east]),
-      ];
+    function cellBounds(cell) {
+      return L.latLngBounds([cell.south, cell.west], [cell.north, cell.east]);
     }
 
-    function buildNeighborBounds(bounds) {
-      const south = bounds.getSouth();
-      const west = bounds.getWest();
-      const north = bounds.getNorth();
-      const east = bounds.getEast();
-      const latSpan = north - south;
-      const lonSpan = east - west;
-
-      return [
-        L.latLngBounds([south, west + lonSpan], [north, east + lonSpan]),
-        L.latLngBounds([south, west - lonSpan], [north, east - lonSpan]),
-        L.latLngBounds([south + latSpan, west], [north + latSpan, east]),
-        L.latLngBounds([south - latSpan, west], [north - latSpan, east]),
-      ];
-    }
-
-    function clampBounds(bounds) {
-      const south = Math.max(-85, bounds.getSouth());
-      const north = Math.min(85, bounds.getNorth());
-      const west = Math.max(-180, bounds.getWest());
-      const east = Math.min(180, bounds.getEast());
-
-      if (north <= south || east <= west) return null;
-      return L.latLngBounds([south, west], [north, east]);
-    }
-
-    async function postOverpass(endpoint, query, timeoutMs = 18000) {
+    async function postOverpass(endpoint, query, signal) {
+      signal.throwIfAborted();
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const abort = () => controller.abort();
+      signal.addEventListener("abort", abort, { once: true });
+      const timeout = setTimeout(abort, 18000);
       try {
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-          body: new URLSearchParams({ data: query }),
-          signal: controller.signal,
+          body: new URLSearchParams({ data: query }), signal: controller.signal,
         });
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        return await response.json();
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.remark || !Array.isArray(data.elements)) throw new Error(data.remark || "Incomplete response");
+        return data.elements;
       } finally {
-        clearTimeout(timeoutId);
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abort);
       }
     }
 
-    async function queryOverpass(query, options = {}) {
-      const { contextLabel = "", silent = false } = options;
-      let lastError = null;
-      const failures = [];
-
+    async function fetchCell(cell, signal, cached) {
+      let lastError;
       for (const endpoint of overpassEndpoints) {
+        signal.throwIfAborted();
         try {
-          if (!silent) {
-            const prefix = contextLabel ? `${contextLabel}: ` : "";
-            setStatus(`${prefix}Loading from ${new URL(endpoint).host} ...`);
-          }
-          return await postOverpass(endpoint, query);
-        } catch (err) {
-          lastError = err;
-          const host = new URL(endpoint).host;
-          failures.push(`${host}: ${err.name === "AbortError" ? "timeout" : err.message}`);
+          const elements = await postOverpass(endpoint, buildOverpassQuery(cellBounds(cell)), signal);
+          signal.throwIfAborted();
+          await cachePut(cell.key, elements);
+          return { elements, source: "network" };
+        } catch (error) {
+          signal.throwIfAborted();
+          lastError = error;
         }
       }
-
-      if (failures.length) {
-        throw new Error(`All Overpass endpoints failed (${failures.join("; ")})`);
-      }
-      throw lastError || new Error("All Overpass endpoints failed.");
+      if (cached && Array.isArray(cached.elements)) return { elements: cached.elements, source: "staleCache" };
+      throw lastError;
     }
 
-    async function getBoundsElements(bounds, options = {}) {
-      const {
-        contextLabel = "",
-        silent = false,
-        allowStaleFallback = true,
-      } = options;
-
-      const cacheKey = getBoundsCacheKey(bounds);
-      const cachedRecord = await cacheGet(cacheKey);
-      if (isCacheFresh(cachedRecord)) {
-        return {
-          elements: cachedRecord.elements || [],
-          source: "cache",
-        };
-      }
-
-      try {
-        const query = buildOverpassQuery(bounds);
-        const data = await queryOverpass(query, { contextLabel, silent });
-        const elements = data.elements || [];
-        await cachePut(cacheKey, elements);
-        return {
-          elements,
-          source: "network",
-        };
-      } catch (err) {
-        if (allowStaleFallback && cachedRecord && Array.isArray(cachedRecord.elements)) {
-          return {
-            elements: cachedRecord.elements,
-            source: "stale-cache",
-          };
-        }
-        throw err;
-      }
-    }
-
-    function schedulePrefetch(bounds) {
-      if (!isDetailMode()) return;
+    function schedulePrefetch(cells, signal) {
       if (Date.now() - lastPrefetchAt < PREFETCH_MIN_INTERVAL_MS) return;
-      if (prefetchTimer) clearTimeout(prefetchTimer);
-      const targetBounds = L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
-      prefetchTimer = setTimeout(() => prefetchNearby(targetBounds), 1200);
-    }
-
-    async function prefetchNearby(bounds) {
-      if (prefetchInProgress) return;
-      if (boundsArea(bounds) > SPLIT_QUERY_AREA) return;
-
-      const neighborBounds = buildNeighborBounds(bounds)
-        .map(clampBounds)
-        .filter(Boolean)
-        .slice(0, 2);
-
-      if (!neighborBounds.length) return;
-
-      prefetchInProgress = true;
-      lastPrefetchAt = Date.now();
-      try {
-        for (let i = 0; i < neighborBounds.length; i += 1) {
-          const candidate = neighborBounds[i];
-          const cacheKey = getBoundsCacheKey(candidate);
-          const cachedRecord = await cacheGet(cacheKey);
-          if (isCacheFresh(cachedRecord)) continue;
-
-          try {
-            await getBoundsElements(candidate, {
-              contextLabel: `Prefetch ${i + 1}/${neighborBounds.length}`,
-              silent: true,
-              allowStaleFallback: false,
-            });
-          } catch (err) {
-            // Prefetch errors are intentionally ignored.
+      prefetchTimer = setTimeout(async () => {
+        lastPrefetchAt = Date.now();
+        try {
+          for (const cell of RailData.neighbors(cells).slice(0, 2)) {
+            signal.throwIfAborted();
+            const cached = await cacheGet(cell.key);
+            if (!isCacheFresh(cached)) await fetchCell(cell, signal, cached);
           }
-        }
-      } finally {
-        prefetchInProgress = false;
-      }
+        } catch { /* Prefetch is optional and stops on navigation or failure. */ }
+      }, 1200);
     }
 
     function overpassToGeoJSON(overpassElements) {
@@ -940,89 +870,98 @@ out tags geom;`;
       return features;
     }
 
-    async function loadDataInView(trigger = "manual") {
-      if (!isDetailMode()) {
-        updateModeUI();
-        return;
-      }
-
-      if (isLoading) {
-        pendingReload = true;
-        return;
-      }
-
-      const bounds = map.getBounds();
-      const viewportError = validateViewport(bounds);
-      if (viewportError) {
-        if (trigger === "auto") {
-          setStatus(`${viewportError} Auto-update paused until you zoom in.`, true);
-        } else {
-          setStatus(viewportError, true);
-        }
-        return;
-      }
-
-      isLoading = true;
-      detailLoadFailed = false;
+    function cancelLoading() {
+      loadGeneration++;
+      if (loadController) loadController.abort();
+      clearTimeout(autoReloadTimer);
+      clearTimeout(prefetchTimer);
+      isLoading = false;
+      detailReady = false;
       updateModeUI();
-      try {
-        const area = boundsArea(bounds);
-        let allElements = [];
-        const loadMeta = { cache: 0, network: 0, staleCache: 0 };
-
-        if (area > SPLIT_QUERY_AREA) {
-          const chunks = splitBounds(bounds);
-          setStatus(`Preparing ${chunks.length} smaller Overpass queries...`);
-          for (let i = 0; i < chunks.length; i += 1) {
-            const chunkResult = await getBoundsElements(chunks[i], {
-              contextLabel: `Chunk ${i + 1}/${chunks.length}`,
-            });
-            if (chunkResult.source === "cache") loadMeta.cache += 1;
-            else if (chunkResult.source === "stale-cache") loadMeta.staleCache += 1;
-            else loadMeta.network += 1;
-            allElements = allElements.concat(chunkResult.elements || []);
-          }
-        } else {
-          setStatus("Preparing Overpass query...");
-          const result = await getBoundsElements(bounds);
-          if (result.source === "cache") loadMeta.cache += 1;
-          else if (result.source === "stale-cache") loadMeta.staleCache += 1;
-          else loadMeta.network += 1;
-          allElements = result.elements || [];
-        }
-
-        const features = overpassToGeoJSON(allElements);
-
-        lastLoadedFeatures = features;
-        renderByThreshold(loadMeta);
-        schedulePrefetch(bounds);
-      } catch (err) {
-        detailLoadFailed = true;
-        setStatus(`Load failed: ${err.message}`, true);
-      } finally {
-        isLoading = false;
-        updateModeUI();
-        if (pendingReload) {
-          pendingReload = false;
-          loadDataInView("auto");
-        }
-      }
     }
 
-    function scheduleAutoReload() {
-      if (!isDetailMode()) {
-        updateModeUI();
+    async function loadDataInView() {
+      cancelLoading();
+      if (!isDetailMode()) return;
+      const bounds = map.getBounds();
+      const cells = RailData.cellsForBounds({ south: bounds.getSouth(), west: bounds.getWest(),
+        north: bounds.getNorth(), east: bounds.getEast() });
+      if (validateViewport(bounds) || cells.length > MAX_VISIBLE_CELLS) {
+        setStatus("Zoom in a little more for line details.");
         return;
       }
-      if (autoReloadTimer) clearTimeout(autoReloadTimer);
-      autoReloadTimer = setTimeout(() => loadDataInView("auto"), 600);
+      const generation = loadGeneration;
+      loadController = new AbortController();
+      const { signal } = loadController;
+      const current = () => generation === loadGeneration && !signal.aborted;
+      isLoading = true;
+      detailLoadFailed = false;
+      updateRetryButton();
+      setStatus("Loading line details...");
+      const results = new Map();
+      const meta = { cache: 0, network: 0, staleCache: 0 };
+      let failed = 0;
+      const showResults = (complete = false) => {
+        if (!current()) return;
+        const features = overpassToGeoJSON([...results.values()].flat());
+        // Preserve previous geometry until the new viewport has complete coverage.
+        lastLoadedFeatures = complete ? features : [...new Map(
+          [...lastLoadedFeatures, ...features].map(f => [f.properties.osm_id, f])).values()];
+        renderByThreshold(meta);
+      };
+      try {
+        const cached = await Promise.all(cells.map(cell => cacheGet(cell.key)));
+        if (!current()) return;
+        const missing = [];
+        cells.forEach((cell, i) => {
+          if (isCacheFresh(cached[i])) {
+            results.set(cell.key, cached[i].elements);
+            meta.cache++;
+          } else missing.push({ cell, cached: cached[i] });
+        });
+        if (results.size) showResults();
+        await RailData.pool(missing, 2, signal, async ({ cell, cached }) => {
+          try {
+            const result = await fetchCell(cell, signal, cached);
+            if (!current()) return;
+            results.set(cell.key, result.elements);
+            meta[result.source]++;
+            showResults();
+            setStatus(`Loading line details: ${results.size}/${cells.length} areas`);
+          } catch (error) {
+            signal.throwIfAborted();
+            failed++;
+            document.getElementById("loadDetails").textContent = error.message;
+          }
+        });
+        if (!current()) return;
+        isLoading = false;
+        detailLoadFailed = failed > 0 || meta.staleCache > 0;
+        detailReady = !detailLoadFailed;
+        showResults(failed === 0);
+        if (detailLoadFailed) setStatus(failed ? "Some details could not load. Showing available lines." : "Offline data shown. Some details may be outdated.", true);
+        else schedulePrefetch(cells, signal);
+      } catch (error) {
+        if (!current()) return;
+        detailLoadFailed = true;
+        setStatus("Details unavailable. You can retry.", true);
+      } finally {
+        if (current()) {
+          isLoading = false;
+          updateModeUI();
+        }
+      }
     }
 
     function handleMapMoveEnd() {
-      updateModeUI();
-      scheduleAutoReload();
+      cancelLoading();
+      if (isDetailMode()) {
+        setStatus("Loading line details...");
+        autoReloadTimer = setTimeout(loadDataInView, 350);
+      }
     }
 
+    map.on("movestart", cancelLoading);
     retryBtn.addEventListener("click", () => loadDataInView("manual"));
     map.on("moveend", handleMapMoveEnd);
     basemapInput.addEventListener("change", () => {

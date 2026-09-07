@@ -46,9 +46,15 @@ python3 -m http.server 8081
 - Both modes apply the same threshold filter (`>=` selected value).
 - Lines are rendered slightly thicker for better readability.
 - Detail mode auto-updates data after map move/zoom.
-- A `Retry detail data` button appears only when a detail fetch fails.
-- Caches detail query responses in the browser for 45 days.
-- Prefetches nearby detail areas in the background to improve pan responsiveness.
+- Detail data uses fixed 0.5-degree geographic cells, so overlapping views reuse downloads.
+- Fresh cached cells display first; missing cells load with at most two simultaneous requests.
+- Navigation cancels obsolete requests and prevents delayed responses from replacing the current view.
+- Existing lines remain visible while loading. The global overlay stays visible until all detail cells are fresh and ready.
+- A `Retry detail data` button appears for failed requests or outdated fallback data.
+- Caches detail cells in the browser for 45 days. If storage fails or stalls, live loading continues with a bounded in-memory cache.
+- Expired records are retained for up to 90 days as a network-failure fallback, clearly marked as outdated.
+- Prefetches up to two adjacent cells after visible data finishes, at most once every 45 seconds. Navigation cancels prefetching.
+- The control panel keeps its 0.4-alpha background, aligned controls, and mobile layout. Collapse it to reveal more map; expand `About the map and data` for cache details.
 
 ## Notes
 
@@ -56,3 +62,15 @@ python3 -m http.server 8081
 - In global mode, no manual data load is needed.
 - In detail mode, very large map windows may still be rejected to avoid heavy Overpass requests.
 - Data quality depends on OSM tagging coverage.
+- Global speed filtering estimates values from raster colours; it is not an exact numeric filter, particularly near band boundaries. Detail mode filters numeric OSM tags.
+- Existing viewport-based cache records are not reused by the new cell cache and age out automatically.
+
+## Verification
+
+No build step or package installation is required. Run the regression suite with Node.js 18 or newer:
+
+```bash
+node --test tests/rail-data.test.cjs
+```
+
+The suite covers cell reuse and dateline wrapping, cache freshness, request concurrency and cancellation, delayed responses, duplicate ways, threshold changes, storage errors, network failures, and stale fallback. Browser checks should also cover panel collapse, keyboard access, mobile fit, dragging, and basemap selection.
